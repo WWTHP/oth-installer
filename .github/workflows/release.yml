@@ -1,0 +1,76 @@
+# Push a tag v<version> (matching Cargo.toml) to build and publish the installers.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: oth-installer-windows-x64.exe
+          - os: ubuntu-22.04 # older glibc = runs on more distros
+            artifact: oth-installer-linux-x64.tar.gz
+          - os: macos-latest
+            artifact: oth-installer-macos-universal.tar.gz
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the tag matches Cargo.toml
+        shell: bash
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "v$v" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != Cargo.toml $v"; exit 1; }
+      - name: Test
+        run: cargo test --locked
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          cargo build --release --locked
+          mkdir -p dist && cp target/release/oth-installer.exe dist/${{ matrix.artifact }}
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release --locked
+          mkdir -p dist && tar -C target/release -czf dist/${{ matrix.artifact }} oth-installer
+      - name: Build (macOS universal)
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p dist/pkg
+          lipo -create -output dist/pkg/oth-installer \
+            target/aarch64-apple-darwin/release/oth-installer \
+            target/x86_64-apple-darwin/release/oth-installer
+          tar -C dist/pkg -czf dist/${{ matrix.artifact }} oth-installer
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist && sha256sum * > SHA256SUMS.txt
+          gh release create "$GITHUB_REF_NAME" -R "$GITHUB_REPOSITORY" \
+            --title "WWTHP Mod Installer ${GITHUB_REF_NAME#v}" --generate-notes ./*

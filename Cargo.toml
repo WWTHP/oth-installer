@@ -1,0 +1,28 @@
+[package]
+name = "oth-installer"
+version = "0.1.0"
+description = "Installs and removes the WWTHP Over the Hill mods"
+publish = false
+edition = "2021"
+
+[dependencies]
+dirs = "7.0.0"
+eframe = { version = "0.37.0", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+rfd = "0.18.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+sysinfo = "0.40.4"
+ureq = "3.5.2"
+zip = "9.8.2"
+
+[target."cfg(windows)".dependencies]
+winreg = "0.56.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
