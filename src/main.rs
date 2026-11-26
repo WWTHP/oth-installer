@@ -1,7 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 //! WWTHP mod installer for Over the Hill: finds the game, installs/removes the mods and MelonLoader.
 
-mod auth;
 mod config;
 mod game;
 mod github;
@@ -9,10 +8,7 @@ mod install;
 mod vdf;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use eframe::egui;
 use github::RemoteMod;
@@ -26,39 +22,21 @@ const MELON_URL: &str =
 const MELON_SHA256: &str = "5b2b2f3d1cd42b59ec886c5bdc2663edae87a0097a4f4a8f58c0965a99dda416";
 
 enum Job {
-    /// Load the mod list; `Some(token)` = check and save a newly entered token first.
-    Refresh(Option<String>),
+    Refresh,
     Install(RemoteMod),
     Remove(String),
     InstallMelon,
 }
 
-struct Account {
-    login: String,
-    source: auth::Source,
-}
-
 enum Done {
-    Mods(Result<(Account, Vec<RemoteMod>), String>),
+    Mods(Result<Vec<RemoteMod>, String>),
     Op(Result<String, String>),
-    DeviceCode(Result<auth::DeviceCode, String>),
-    SignedIn(Result<String, String>),
-}
-
-struct SignIn {
-    code: Option<auth::DeviceCode>,
-    cancel: Arc<AtomicBool>,
 }
 
 struct App {
     game: Option<PathBuf>,
     game_error: Option<String>,
     path_input: String,
-    account: Option<Account>,
-    needs_login: bool,
-    token_input: String,
-    signin: Option<SignIn>,
-    signin_error: Option<String>,
     mods: Vec<RemoteMod>,
     mods_error: Option<String>,
     manifest: install::Manifest,
@@ -80,11 +58,6 @@ impl App {
             game: None,
             game_error: None,
             path_input: String::new(),
-            account: None,
-            needs_login: false,
-            token_input: String::new(),
-            signin: None,
-            signin_error: None,
             mods: Vec::new(),
             mods_error: None,
             manifest: install::Manifest::default(),
@@ -106,12 +79,12 @@ impl App {
                 )
             }
         }
-        app.refresh(None);
+        app.refresh();
         app
     }
 
-    fn refresh(&mut self, new_token: Option<String>) {
-        self.run(Job::Refresh(new_token), "Loading the mod list from GitHub…");
+    fn refresh(&mut self) {
+        self.run(Job::Refresh, "Loading the mod list from GitHub…");
     }
 
     fn set_game(&mut self, p: PathBuf) {
@@ -160,7 +133,7 @@ impl App {
         if self.busy.is_some() {
             return;
         }
-        let needs_game = !matches!(job, Job::Refresh(_));
+        let needs_game = !matches!(job, Job::Refresh);
         if needs_game && game::is_running() {
             self.log(
                 false,
@@ -174,60 +147,12 @@ impl App {
         }
         self.busy = Some(label.to_string());
         self.spawn(move || match job {
-            Job::Refresh(t) => Done::Mods(load_mods(t)),
+            Job::Refresh => Done::Mods(github::list_mods()),
             Job::Install(m) => Done::Op(do_install(&game.unwrap(), &m)),
             Job::Remove(name) => Done::Op(
                 install::uninstall(&game.unwrap(), &name).map(|()| format!("Removed {name}.")),
             ),
             Job::InstallMelon => Done::Op(do_install_melon(&game.unwrap())),
-        });
-    }
-
-    fn start_signin(&mut self, client_id: &'static str) {
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.signin = Some(SignIn {
-            code: None,
-            cancel: cancel.clone(),
-        });
-        self.signin_error = None;
-        let tx = self.tx.clone();
-        let ctx = self.ctx.clone();
-        std::thread::spawn(move || {
-            let code = match auth::start_device_flow(client_id) {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = tx.send(Done::DeviceCode(Err(e)));
-                    ctx.request_repaint();
-                    return;
-                }
-            };
-            let _ = tx.send(Done::DeviceCode(Ok(code.clone())));
-            ctx.request_repaint();
-            let deadline = Instant::now() + Duration::from_secs(code.expires_in);
-            let mut interval = code.interval.max(5);
-            let result = loop {
-                // Sleep in short steps so Cancel is prompt.
-                let wake = Instant::now() + Duration::from_secs(interval);
-                while Instant::now() < wake {
-                    if cancel.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-                if Instant::now() > deadline {
-                    break Err("The sign-in code expired. Start again.".to_string());
-                }
-                match auth::poll_device_flow(client_id, &code.device_code) {
-                    auth::PollResult::Pending => {}
-                    auth::PollResult::SlowDown => interval += 5,
-                    auth::PollResult::Token(t) => break Ok(t),
-                    auth::PollResult::Failed(e) => break Err(e),
-                }
-            };
-            if !cancel.load(Ordering::Relaxed) {
-                let _ = tx.send(Done::SignedIn(result));
-                ctx.request_repaint();
-            }
         });
     }
 
@@ -240,47 +165,17 @@ impl App {
 
     fn poll(&mut self) {
         while let Ok(done) = self.rx.try_recv() {
+            self.busy = None;
             match done {
-                Done::Mods(r) => {
-                    self.busy = None;
-                    match r {
-                        Ok((acct, m)) => {
-                            self.account = Some(acct);
-                            self.needs_login = false;
-                            self.token_input.clear();
-                            self.mods = m;
-                            self.mods_error = None;
-                        }
-                        Err(e) => {
-                            let auth_problem = e.starts_with(github::AUTH_REJECTED)
-                                || e.starts_with(auth::NOT_SIGNED_IN);
-                            if auth_problem {
-                                self.account = None;
-                                self.needs_login = true;
-                                self.mods.clear();
-                            }
-                            self.mods_error = Some(e);
-                        }
-                    }
+                Done::Mods(Ok(m)) => {
+                    self.mods = m;
+                    self.mods_error = None;
                 }
+                Done::Mods(Err(e)) => self.mods_error = Some(e),
                 Done::Op(r) => {
-                    self.busy = None;
                     let ok = r.is_ok();
                     self.log(ok, r.unwrap_or_else(|e| e));
                     self.reload_local();
-                }
-                Done::DeviceCode(Ok(code)) => {
-                    if let Some(s) = &mut self.signin {
-                        s.code = Some(code);
-                    }
-                }
-                Done::DeviceCode(Err(e)) | Done::SignedIn(Err(e)) => {
-                    self.signin = None;
-                    self.signin_error = Some(e);
-                }
-                Done::SignedIn(Ok(token)) => {
-                    self.signin = None;
-                    self.refresh(Some(token));
                 }
             }
         }
@@ -291,118 +186,6 @@ impl App {
             Some(g) => install::state(g, &self.manifest, name),
             None => LocalState::NotInstalled,
         }
-    }
-
-    fn account_section(&mut self, ui: &mut egui::Ui) {
-        ui.heading("GitHub account");
-        if let Some(a) = &self.account {
-            let text = format!("Signed in as {} (via {})", a.login, a.source.label());
-            let can_sign_out = a.source == auth::Source::Saved;
-            let mut sign_out = false;
-            ui.horizontal(|ui| {
-                ui.label(text);
-                sign_out = can_sign_out && ui.button("Sign out").clicked();
-            });
-            if sign_out {
-                auth::forget();
-                self.account = None;
-                self.mods.clear();
-                self.needs_login = true;
-                self.mods_error = None;
-            }
-            return;
-        }
-        if !self.needs_login {
-            ui.weak("Checking…");
-            return;
-        }
-        ui.label("The WWTHP mods are private: sign in with a GitHub account that has access.");
-        if let Some(e) = &self.signin_error {
-            ui.colored_label(ui.visuals().error_fg_color, e);
-        }
-
-        if let Some(cid) = auth::client_id() {
-            match self.signin.as_ref().map(|s| s.code.clone()) {
-                None => {
-                    if ui
-                        .add_enabled(
-                            self.busy.is_none(),
-                            egui::Button::new("Sign in with GitHub"),
-                        )
-                        .clicked()
-                    {
-                        self.start_signin(cid);
-                    }
-                }
-                Some(None) => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label("Asking GitHub for a code…");
-                    });
-                }
-                Some(Some(code)) => self.device_code_ui(ui, &code),
-            }
-            ui.add_space(6.0);
-        }
-
-        egui::CollapsingHeader::new("Or paste a token")
-            .default_open(auth::client_id().is_none())
-            .show(ui, |ui| {
-                ui.label(
-                    "Create a classic token with the \"repo\" scope at github.com → Settings → \
-                     Developer settings → Personal access tokens, then paste it here.",
-                );
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.token_input)
-                            .password(true)
-                            .hint_text("ghp_…")
-                            .desired_width(280.0),
-                    );
-                    let ok = !self.token_input.trim().is_empty() && self.busy.is_none();
-                    if ui.add_enabled(ok, egui::Button::new("Use token")).clicked() {
-                        let t = self.token_input.trim().to_string();
-                        self.refresh(Some(t));
-                    }
-                });
-                ui.weak("With the GitHub CLI installed, `gh auth login` also works; then press Refresh.");
-            });
-    }
-
-    fn device_code_ui(&mut self, ui: &mut egui::Ui, code: &auth::DeviceCode) {
-        ui.horizontal(|ui| {
-            qr_code(ui, &code.verification_uri, 150.0);
-            ui.vertical(|ui| {
-                ui.label("On any phone or computer, open");
-                ui.horizontal(|ui| {
-                    ui.hyperlink(&code.verification_uri);
-                    if ui.small_button("Copy").clicked() {
-                        ui.ctx().copy_text(code.verification_uri.clone());
-                    }
-                });
-                ui.label("and enter this code:");
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(&code.user_code)
-                            .monospace()
-                            .size(28.0)
-                            .strong(),
-                    );
-                    if ui.small_button("Copy").clicked() {
-                        ui.ctx().copy_text(code.user_code.clone());
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("Waiting for you to approve…");
-                    if ui.button("Cancel").clicked() {
-                        if let Some(s) = self.signin.take() {
-                            s.cancel.store(true, Ordering::Relaxed);
-                        }
-                    }
-                });
-            });
-        });
     }
 
     fn game_section(&mut self, ui: &mut egui::Ui) {
@@ -490,20 +273,15 @@ impl App {
             ui.heading("WWTHP mods");
             if ui.add_enabled(idle, egui::Button::new("Refresh")).clicked() {
                 self.reload_local();
-                self.refresh(None);
+                self.refresh();
             }
         });
         if let Some(e) = &self.mods_error {
-            if !self.needs_login {
-                ui.colored_label(ui.visuals().error_fg_color, e);
-            }
+            ui.colored_label(ui.visuals().error_fg_color, e);
             return;
         }
         if self.game.is_none() {
             ui.label("Choose the game folder first.");
-            return;
-        }
-        if self.account.is_none() {
             return;
         }
         if !matches!(self.melon, game::MelonStatus::Installed(_)) {
@@ -574,7 +352,7 @@ impl App {
                 }
             });
         if self.mods.is_empty() && idle {
-            ui.label("No mods visible to this GitHub account. Ask for access to the WWTHP repos.");
+            ui.label("No released mods found.");
         }
         if !pending.is_empty() {
             ui.add_space(6.0);
@@ -615,54 +393,15 @@ impl App {
     }
 }
 
-/// Draws a QR code (the sign-in URL, so a phone camera can open it).
-fn qr_code(ui: &mut egui::Ui, data: &str, size: f32) {
-    let Ok(code) = qrcode::QrCode::new(data.as_bytes()) else {
-        return;
-    };
-    let w = code.width();
-    let quiet = 2;
-    let cells = (w + 2 * quiet) as f32;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
-    let p = ui.painter();
-    p.rect_filled(rect, 4.0, egui::Color32::WHITE);
-    let cell = size / cells;
-    for (i, c) in code.to_colors().iter().enumerate() {
-        if *c == qrcode::Color::Dark {
-            let (x, y) = ((i % w + quiet) as f32, (i / w + quiet) as f32);
-            let min = rect.min + egui::vec2(x * cell, y * cell);
-            p.rect_filled(
-                egui::Rect::from_min_size(min, egui::vec2(cell + 0.5, cell + 0.5)),
-                0.0,
-                egui::Color32::BLACK,
-            );
-        }
-    }
-}
-
-fn load_mods(new_token: Option<String>) -> Result<(Account, Vec<RemoteMod>), String> {
-    let (token, source) = match new_token {
-        Some(t) => (t, auth::Source::Saved),
-        None => auth::find().ok_or_else(|| auth::NOT_SIGNED_IN.to_string())?,
-    };
-    let login = github::whoami(&token)?;
-    if source == auth::Source::Saved {
-        auth::save(&token)?;
-    }
-    let mods = github::list_mods(&token)?;
-    Ok((Account { login, source }, mods))
-}
-
 fn do_install(game: &std::path::Path, m: &RemoteMod) -> Result<String, String> {
-    let token = auth::token()?;
-    let bytes = github::download_asset(&token, github::ORG, &m.repo, m.asset.id)?;
+    let bytes = github::download(&m.asset.browser_download_url)?;
     github::verify(&bytes, m.sha256.as_deref(), &m.asset.name)?;
     install::install(game, &m.name, &m.version, &m.repo, &m.asset.name, &bytes)?;
     Ok(format!("Installed {} {}.", m.name, m.version))
 }
 
 fn do_install_melon(game: &std::path::Path) -> Result<String, String> {
-    let bytes = github::download_public(MELON_URL)?;
+    let bytes = github::download(MELON_URL)?;
     github::verify(&bytes, Some(MELON_SHA256), "MelonLoader")?;
     install::install_melonloader(game, &bytes)?;
     Ok(format!(
@@ -698,8 +437,6 @@ impl eframe::App for App {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    self.account_section(ui);
-                    ui.separator();
                     self.game_section(ui);
                     if self.game.is_some() {
                         ui.separator();

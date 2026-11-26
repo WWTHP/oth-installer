@@ -22,9 +22,6 @@ jobs:
             artifact: oth-installer-macos-universal.tar.gz
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
-    env:
-      # Client id of the WWTHP GitHub App used for "Sign in with GitHub" (README §Sign-in setup).
-      OTH_GITHUB_CLIENT_ID: ${{ vars.OTH_GITHUB_CLIENT_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -35,10 +32,6 @@ jobs:
           test "v$v" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != Cargo.toml $v"; exit 1; }
       - name: Test
         run: cargo test --locked
-      - name: Warn when sign-in is not configured
-        if: env.OTH_GITHUB_CLIENT_ID == ''
-        shell: bash
-        run: echo "::warning::OTH_GITHUB_CLIENT_ID is not set; this build only offers token paste and gh."
       - name: Build (Windows)
         if: runner.os == 'Windows'
         shell: bash
