@@ -1,7 +1,6 @@
-//! GitHub access: the token comes from the GitHub CLI (`gh auth token`), since the mod repos are private.
+//! GitHub access: mod list, releases and downloads. The repos are public, so no login.
 
 use std::io::Read;
-use std::process::Command;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -26,8 +25,8 @@ pub struct RemoteMod {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Asset {
-    pub id: u64,
     pub name: String,
+    pub browser_download_url: String,
     #[serde(default)]
     pub digest: Option<String>,
 }
@@ -52,104 +51,42 @@ struct Release {
     assets: Vec<Asset>,
 }
 
-/// Finds a GitHub token: `GH_TOKEN` / `GITHUB_TOKEN`, else `gh auth token`.
-pub fn token() -> Result<String, String> {
-    for var in ["GH_TOKEN", "GITHUB_TOKEN"] {
-        if let Ok(t) = std::env::var(var) {
-            if !t.trim().is_empty() {
-                return Ok(t.trim().to_string());
-            }
-        }
-    }
-    let mut last_err = String::from("the GitHub CLI (gh) was not found");
-    for gh in gh_candidates() {
-        let mut cmd = Command::new(&gh);
-        cmd.args(["auth", "token", "--hostname", "github.com"]);
-        hide_console(&mut cmd);
-        match cmd.output() {
-            Ok(out) if out.status.success() => {
-                let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !t.is_empty() {
-                    return Ok(t);
-                }
-            }
-            Ok(out) => {
-                last_err = format!(
-                    "`gh auth token` failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-            }
-            Err(_) => {}
-        }
-    }
-    Err(format!(
-        "No GitHub login: {last_err}. Install the GitHub CLI (https://cli.github.com) and run `gh auth login`."
-    ))
-}
-
-fn gh_candidates() -> Vec<String> {
-    let mut c = vec!["gh".to_string()];
-    // Apps started from Finder/the desktop don't get the shell's PATH.
-    if cfg!(target_os = "macos") {
-        c.extend(["/opt/homebrew/bin/gh".into(), "/usr/local/bin/gh".into()]);
-    } else if cfg!(windows) {
-        c.push(r"C:\Program Files\GitHub CLI\gh.exe".into());
-    } else {
-        c.extend([
-            "/usr/bin/gh".into(),
-            "/usr/local/bin/gh".into(),
-            "/home/linuxbrew/.linuxbrew/bin/gh".into(),
-        ]);
-    }
-    c
-}
-
-#[cfg(windows)]
-fn hide_console(cmd: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    cmd.creation_flags(CREATE_NO_WINDOW);
-}
-#[cfg(not(windows))]
-fn hide_console(_: &mut Command) {}
-
-fn agent(follow_redirects: bool) -> ureq::Agent {
+fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(300)))
-        .max_redirects(if follow_redirects { 10 } else { 0 })
-        .max_redirects_will_error(false)
         .http_status_as_error(false)
         .user_agent("oth-installer")
         .build()
         .into()
 }
 
-fn api_get(token: &str, path: &str) -> Result<(u16, String), String> {
-    let mut resp = agent(true)
+fn api_json<T: for<'de> Deserialize<'de>>(path: &str) -> Result<Option<T>, String> {
+    let mut resp = agent()
         .get(format!("https://api.github.com{path}"))
-        .header("Authorization", format!("Bearer {token}"))
         .header("Accept", "application/vnd.github+json")
         .header("X-GitHub-Api-Version", "2022-11-28")
         .call()
-        .map_err(|e| format!("GitHub request failed: {e}"))?;
+        .map_err(|e| format!("Can't reach GitHub (offline?): {e}"))?;
     let status = resp.status().as_u16();
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+    };
+    let (remaining, reset) = (header("x-ratelimit-remaining"), header("x-ratelimit-reset"));
     let body = resp
         .body_mut()
         .with_config()
         .limit(16 * 1024 * 1024)
         .read_to_string()
         .map_err(|e| format!("GitHub response unreadable: {e}"))?;
-    Ok((status, body))
-}
-
-fn api_json<T: for<'de> Deserialize<'de>>(token: &str, path: &str) -> Result<Option<T>, String> {
-    let (status, body) = api_get(token, path)?;
     match status {
         200 => serde_json::from_str(&body)
             .map(Some)
             .map_err(|e| format!("bad JSON from {path}: {e}")),
         404 => Ok(None),
-        401 => Err("GitHub rejected the token (401). Run `gh auth login` again.".into()),
+        403 | 429 if remaining.as_deref() == Some("0") => Err(rate_limited(reset.as_deref())),
         s => Err(format!(
             "GitHub {path}: HTTP {s}: {}",
             body.chars().take(200).collect::<String>()
@@ -157,22 +94,33 @@ fn api_json<T: for<'de> Deserialize<'de>>(token: &str, path: &str) -> Result<Opt
     }
 }
 
+/// GitHub allows 60 anonymous API requests an hour per IP; a refresh uses about 7.
+fn rate_limited(reset: Option<&str>) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match reset.and_then(|r| r.parse::<u64>().ok()) {
+        Some(at) if at > now => format!(
+            "GitHub's hourly limit for this network is used up. Try again in {} min.",
+            (at - now).div_ceil(60)
+        ),
+        _ => "GitHub's hourly limit for this network is used up. Try again later.".into(),
+    }
+}
+
 /// Every mod repo in the org with a published release.
-pub fn list_mods(token: &str) -> Result<Vec<RemoteMod>, String> {
-    let repos: Vec<Repo> = api_json(token, &format!("/orgs/{ORG}/repos?per_page=100&type=all"))?
-        .ok_or_else(|| {
-            format!("Organization {ORG} not found or not visible to this GitHub login.")
-        })?;
+pub fn list_mods() -> Result<Vec<RemoteMod>, String> {
+    let repos: Vec<Repo> = api_json(&format!("/orgs/{ORG}/repos?per_page=100&type=public"))?
+        .ok_or_else(|| format!("GitHub organization {ORG} not found."))?;
     let mut mods = Vec::new();
     for repo in repos {
         if repo.archived || !repo.name.starts_with("oth-") || NOT_MODS.contains(&repo.name.as_str())
         {
             continue;
         }
-        let Some(rel): Option<Release> = api_json(
-            token,
-            &format!("/repos/{ORG}/{}/releases/latest", repo.name),
-        )?
+        let Some(rel): Option<Release> =
+            api_json(&format!("/repos/{ORG}/{}/releases/latest", repo.name))?
         else {
             continue; // no release yet
         };
@@ -233,39 +181,15 @@ fn sha_from_notes(body: &str, file: &str) -> Option<String> {
         })
 }
 
-/// Downloads a release asset by id. The API answers with a redirect to a signed storage URL;
-/// that hop is followed without the token so it never leaves GitHub's API.
-pub fn download_asset(
-    token: &str,
-    owner: &str,
-    repo: &str,
-    asset_id: u64,
-) -> Result<Vec<u8>, String> {
-    let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/assets/{asset_id}");
-    let mut resp = agent(false)
-        .get(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Accept", "application/octet-stream")
+/// Downloads a release asset or other public file, following redirects.
+pub fn download(url: &str) -> Result<Vec<u8>, String> {
+    let resp = agent()
+        .get(url)
         .call()
         .map_err(|e| format!("Download failed: {e}"))?;
     let status = resp.status().as_u16();
-    if (300..400).contains(&status) {
-        let loc = resp
-            .headers()
-            .get("location")
-            .and_then(|v| v.to_str().ok())
-            .ok_or("Download redirect without a location")?
-            .to_string();
-        resp = agent(true)
-            .get(&loc)
-            .call()
-            .map_err(|e| format!("Download failed: {e}"))?;
-    }
-    let status = resp.status().as_u16();
     if status != 200 {
-        return Err(format!(
-            "Download of asset {asset_id} from {repo} failed: HTTP {status}"
-        ));
+        return Err(format!("Download of {url} failed: HTTP {status}"));
     }
     let mut bytes = Vec::new();
     resp.into_body()
@@ -274,22 +198,6 @@ pub fn download_asset(
         .read_to_end(&mut bytes)
         .map_err(|e| format!("Download interrupted: {e}"))?;
     Ok(bytes)
-}
-
-/// The asset of a specific public release (used for MelonLoader).
-pub fn release_asset(
-    token: &str,
-    owner: &str,
-    repo: &str,
-    tag: &str,
-    name: &str,
-) -> Result<Asset, String> {
-    let rel: Release = api_json(token, &format!("/repos/{owner}/{repo}/releases/tags/{tag}"))?
-        .ok_or_else(|| format!("{owner}/{repo} release {tag} not found"))?;
-    rel.assets
-        .into_iter()
-        .find(|a| a.name == name)
-        .ok_or_else(|| format!("{owner}/{repo} {tag} has no {name}"))
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -313,10 +221,10 @@ pub fn verify(bytes: &[u8], expected: Option<&str>, what: &str) -> Result<(), St
 mod tests {
     use super::*;
 
-    fn asset(id: u64, name: &str) -> Asset {
+    fn asset(_id: u64, name: &str) -> Asset {
         Asset {
-            id,
             name: name.into(),
+            browser_download_url: format!("https://example.invalid/{name}"),
             digest: None,
         }
     }
@@ -333,8 +241,8 @@ mod tests {
         };
         let m = to_remote_mod("oth-wombatgd", "d".into(), rel).unwrap();
         assert_eq!(
-            (m.name.as_str(), m.version.as_str(), m.asset.id),
-            ("WombatGD", "0.6.0", 2)
+            (m.name.as_str(), m.version.as_str(), m.asset.name.as_str()),
+            ("WombatGD", "0.6.0", "WombatGD-0.6.0.zip")
         );
         assert_eq!(m.sha256.as_deref(), Some(hex));
     }
@@ -380,20 +288,19 @@ mod tests {
     }
 }
 
-/// Live check against GitHub (needs `gh auth login`): `cargo test -- --ignored`.
+/// Live check against GitHub: `cargo test -- --ignored`.
 #[cfg(test)]
 mod live {
     use super::*;
 
     #[test]
-    #[ignore = "network + GitHub login"]
+    #[ignore = "network"]
     fn lists_downloads_and_verifies_every_mod() {
-        let t = token().unwrap();
-        let mods = list_mods(&t).unwrap();
+        let mods = list_mods().unwrap();
         assert!(!mods.is_empty());
         let game = tempfile::tempdir().unwrap();
         for m in &mods {
-            let bytes = download_asset(&t, ORG, &m.repo, m.asset.id).unwrap();
+            let bytes = download(&m.asset.browser_download_url).unwrap();
             verify(&bytes, m.sha256.as_deref(), &m.asset.name).unwrap();
             crate::install::install(
                 game.path(),
@@ -416,27 +323,13 @@ mod live {
         for m in &mods {
             crate::install::uninstall(game.path(), &m.name).unwrap();
         }
-        let a = release_asset(
-            &t,
-            "LavaGang",
-            "MelonLoader",
-            "v0.7.3",
-            "MelonLoader.x64.zip",
-        )
-        .unwrap();
-        let z = download_asset(&t, "LavaGang", "MelonLoader", a.id).unwrap();
-        verify(
-            &z,
-            a.digest.as_deref().and_then(|d| d.strip_prefix("sha256:")),
-            "ml",
-        )
-        .unwrap();
+        let z = download(crate::MELON_URL).unwrap();
+        verify(&z, Some(crate::MELON_SHA256), "MelonLoader").unwrap();
         crate::install::install_melonloader(game.path(), &z).unwrap();
         assert!(game.path().join("version.dll").is_file());
         assert!(game
             .path()
             .join("MelonLoader/net6/MelonLoader.dll")
             .is_file());
-        println!("melonloader digest={:?}", a.digest);
     }
 }

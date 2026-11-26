@@ -2,6 +2,7 @@
 name = "oth-installer"
 version = "0.1.0"
 description = "Installs and removes the WWTHP Over the Hill mods"
+license = "MIT"
 publish = false
 edition = "2021"
 

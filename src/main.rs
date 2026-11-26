@@ -14,8 +14,12 @@ use eframe::egui;
 use github::RemoteMod;
 use install::LocalState;
 
-const MELON_TAG: &str = "v0.7.3";
-const MELON_ASSET: &str = "MelonLoader.x64.zip"; // the game is the Windows x64 build everywhere
+const MELON_VERSION: &str = "0.7.3";
+/// The game is the Windows x64 build everywhere (Proton/CrossOver included).
+const MELON_URL: &str =
+    "https://github.com/LavaGang/MelonLoader/releases/download/v0.7.3/MelonLoader.x64.zip";
+/// Pinned: GitHub's digest for that asset.
+const MELON_SHA256: &str = "5b2b2f3d1cd42b59ec886c5bdc2663edae87a0097a4f4a8f58c0965a99dda416";
 
 enum Job {
     Refresh,
@@ -32,6 +36,7 @@ enum Done {
 struct App {
     game: Option<PathBuf>,
     game_error: Option<String>,
+    path_input: String,
     mods: Vec<RemoteMod>,
     mods_error: Option<String>,
     manifest: install::Manifest,
@@ -44,11 +49,15 @@ struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, deck: bool) -> Self {
+        if deck {
+            cc.egui_ctx.set_zoom_factor(1.4);
+        }
         let (tx, rx) = channel();
         let mut app = Self {
             game: None,
             game_error: None,
+            path_input: String::new(),
             mods: Vec::new(),
             mods_error: None,
             manifest: install::Manifest::default(),
@@ -65,11 +74,17 @@ impl App {
         match saved.or_else(game::detect) {
             Some(p) => app.set_game(p),
             None => {
-                app.game_error = Some("Couldn't find Over the Hill. Choose the game folder.".into())
+                app.game_error = Some(
+                    "Couldn't find Over the Hill. Choose the game folder, or type its path.".into(),
+                )
             }
         }
-        app.run(Job::Refresh, "Loading the mod list from GitHub…");
+        app.refresh();
         app
+    }
+
+    fn refresh(&mut self) {
+        self.run(Job::Refresh, "Loading the mod list from GitHub…");
     }
 
     fn set_game(&mut self, p: PathBuf) {
@@ -78,6 +93,7 @@ impl App {
                 config::save(&config::Config {
                     game_dir: Some(p.clone()),
                 });
+                self.path_input = p.display().to_string();
                 self.game = Some(p);
                 self.game_error = None;
                 self.reload_local();
@@ -98,9 +114,19 @@ impl App {
         if let Some(g) = &self.game {
             dlg = dlg.set_directory(g);
         }
+        // No portal (e.g. Steam Deck Game Mode) = no dialog; the path box still works.
         if let Some(p) = dlg.pick_folder() {
             self.set_game(p);
         }
+    }
+
+    fn spawn(&self, f: impl FnOnce() -> Done + Send + 'static) {
+        let tx = self.tx.clone();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+            ctx.request_repaint();
+        });
     }
 
     fn run(&mut self, job: Job, label: &str) {
@@ -120,19 +146,13 @@ impl App {
             return;
         }
         self.busy = Some(label.to_string());
-        let tx = self.tx.clone();
-        let ctx = self.ctx.clone();
-        std::thread::spawn(move || {
-            let done = match job {
-                Job::Refresh => Done::Mods(github::token().and_then(|t| github::list_mods(&t))),
-                Job::Install(m) => Done::Op(do_install(&game.unwrap(), &m)),
-                Job::Remove(name) => Done::Op(
-                    install::uninstall(&game.unwrap(), &name).map(|()| format!("Removed {name}.")),
-                ),
-                Job::InstallMelon => Done::Op(do_install_melon(&game.unwrap())),
-            };
-            let _ = tx.send(done);
-            ctx.request_repaint();
+        self.spawn(move || match job {
+            Job::Refresh => Done::Mods(github::list_mods()),
+            Job::Install(m) => Done::Op(do_install(&game.unwrap(), &m)),
+            Job::Remove(name) => Done::Op(
+                install::uninstall(&game.unwrap(), &name).map(|()| format!("Removed {name}.")),
+            ),
+            Job::InstallMelon => Done::Op(do_install_melon(&game.unwrap())),
         });
     }
 
@@ -170,15 +190,22 @@ impl App {
 
     fn game_section(&mut self, ui: &mut egui::Ui) {
         ui.heading("Game folder");
-        ui.horizontal(|ui| {
-            match &self.game {
-                Some(g) => ui.monospace(g.display().to_string()),
-                None => ui.colored_label(ui.visuals().warn_fg_color, "Not set"),
-            };
-        });
         if let Some(e) = &self.game_error {
             ui.colored_label(ui.visuals().error_fg_color, e);
         }
+        ui.horizontal(|ui| {
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.path_input)
+                    .hint_text("Path to the \"over the hill\" folder")
+                    .desired_width((ui.available_width() - 90.0).max(200.0)),
+            );
+            let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let changed = self.game.as_ref().map(|g| g.display().to_string())
+                != Some(self.path_input.trim().to_string());
+            if (ui.add_enabled(changed, egui::Button::new("Use")).clicked() || entered) && changed {
+                self.set_game(PathBuf::from(self.path_input.trim()));
+            }
+        });
         ui.horizontal(|ui| {
             if ui.button("Browse…").clicked() {
                 self.browse();
@@ -192,7 +219,7 @@ impl App {
                     Some(p) => self.set_game(p),
                     None => {
                         self.game_error =
-                            Some("Not found in any Steam library. Use Browse… to choose it.".into())
+                            Some("Not found in any Steam library. Browse… or type the path.".into())
                     }
                 }
             }
@@ -207,15 +234,12 @@ impl App {
         let idle = self.busy.is_none();
         ui.horizontal(|ui| {
             let (text, button) = match &self.melon {
-                game::MelonStatus::Installed(Some(v)) => {
-                    (format!("Installed (v{v})"), "Reinstall 0.7.3")
+                game::MelonStatus::Installed(Some(v)) => (format!("Installed (v{v})"), "Reinstall"),
+                game::MelonStatus::Installed(None) => ("Installed".to_string(), "Reinstall"),
+                game::MelonStatus::Broken => ("Incomplete install".to_string(), "Repair"),
+                game::MelonStatus::Missing => {
+                    ("Not installed: the mods need it".to_string(), "Install")
                 }
-                game::MelonStatus::Installed(None) => ("Installed".to_string(), "Reinstall 0.7.3"),
-                game::MelonStatus::Broken => ("Incomplete install".to_string(), "Repair (0.7.3)"),
-                game::MelonStatus::Missing => (
-                    "Not installed: the mods need it".to_string(),
-                    "Install MelonLoader 0.7.3",
-                ),
             };
             let ok = matches!(self.melon, game::MelonStatus::Installed(_));
             let color = if ok {
@@ -224,12 +248,16 @@ impl App {
                 ui.visuals().warn_fg_color
             };
             ui.colored_label(color, text);
-            if ui.add_enabled(idle, egui::Button::new(button)).clicked() {
+            let label = format!("{button} MelonLoader {MELON_VERSION}");
+            if ui.add_enabled(idle, egui::Button::new(label)).clicked() {
                 self.run(Job::InstallMelon, "Installing MelonLoader…");
             }
         });
         if game::runs_under_proton(&game) {
-            ui.label("Proton: set the game's Steam launch options to");
+            ui.label(
+                "Proton (Linux / Steam Deck): in Steam, open the game's Properties → General → \
+                 Launch Options and enter",
+            );
             ui.horizontal(|ui| {
                 ui.code(game::PROTON_LAUNCH_OPTION);
                 if ui.small_button("Copy").clicked() {
@@ -245,7 +273,7 @@ impl App {
             ui.heading("WWTHP mods");
             if ui.add_enabled(idle, egui::Button::new("Refresh")).clicked() {
                 self.reload_local();
-                self.run(Job::Refresh, "Loading the mod list from GitHub…");
+                self.refresh();
             }
         });
         if let Some(e) = &self.mods_error {
@@ -256,8 +284,7 @@ impl App {
             ui.label("Choose the game folder first.");
             return;
         }
-        let melon_ok = matches!(self.melon, game::MelonStatus::Installed(_));
-        if !melon_ok {
+        if !matches!(self.melon, game::MelonStatus::Installed(_)) {
             ui.colored_label(
                 ui.visuals().warn_fg_color,
                 "Install MelonLoader too, or the mods won't load.",
@@ -272,67 +299,57 @@ impl App {
             .collect();
         let pending: Vec<RemoteMod> = rows
             .iter()
-            .filter(|(m, s)| match s {
-                LocalState::Installed(v) => v != &m.version,
-                _ => false,
-            })
+            .filter(|(m, s)| matches!(s, LocalState::Installed(v) if v != &m.version))
             .map(|(m, _)| m.clone())
             .collect();
 
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, true])
+        egui::Grid::new("mods")
+            .num_columns(4)
+            .striped(true)
+            .spacing([16.0, 8.0])
             .show(ui, |ui| {
-                egui::Grid::new("mods")
-                    .num_columns(4)
-                    .striped(true)
-                    .spacing([16.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.strong("Mod");
-                        ui.strong("Installed");
-                        ui.strong("Latest");
-                        ui.strong("");
-                        ui.end_row();
-                        for (m, st) in &rows {
-                            ui.vertical(|ui| {
-                                ui.hyperlink_to(&m.name, &m.release_url);
-                                if !m.description.is_empty() {
-                                    ui.add(
-                                        egui::Label::new(
-                                            egui::RichText::new(&m.description).small().weak(),
-                                        )
-                                        .wrap(),
-                                    );
-                                }
-                            });
-                            match st {
-                                LocalState::NotInstalled => ui.weak("—"),
-                                LocalState::Installed(v) => ui.label(v),
-                                LocalState::Manual => ui.label("yes (manual)"),
-                            };
-                            ui.label(&m.version);
-                            ui.horizontal(|ui| {
-                                let (primary, show_remove) = match st {
-                                    LocalState::NotInstalled => (Some("Install"), false),
-                                    LocalState::Installed(v) if v != &m.version => {
-                                        (Some("Update"), true)
-                                    }
-                                    LocalState::Installed(_) => (Some("Reinstall"), true),
-                                    LocalState::Manual => (Some("Replace"), true),
-                                };
-                                if let Some(p) = primary {
-                                    if ui.add_enabled(idle, egui::Button::new(p)).clicked() {
-                                        action = Some(Job::Install(m.clone()));
-                                    }
-                                }
-                                if show_remove
-                                    && ui.add_enabled(idle, egui::Button::new("Remove")).clicked()
-                                {
-                                    action = Some(Job::Remove(m.name.clone()));
-                                }
-                            });
-                            ui.end_row();
+                ui.strong("Mod");
+                ui.strong("Installed");
+                ui.strong("Latest");
+                ui.strong("");
+                ui.end_row();
+                for (m, st) in &rows {
+                    ui.vertical(|ui| {
+                        ui.set_max_width(320.0);
+                        ui.hyperlink_to(&m.name, &m.release_url);
+                        if !m.description.is_empty() {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&m.description).small().weak(),
+                                )
+                                .wrap(),
+                            );
                         }
                     });
+                    match st {
+                        LocalState::NotInstalled => ui.weak("—"),
+                        LocalState::Installed(v) => ui.label(v),
+                        LocalState::Manual => ui.label("yes (manual)"),
+                    };
+                    ui.label(&m.version);
+                    ui.horizontal(|ui| {
+                        let (primary, show_remove) = match st {
+                            LocalState::NotInstalled => ("Install", false),
+                            LocalState::Installed(v) if v != &m.version => ("Update", true),
+                            LocalState::Installed(_) => ("Reinstall", true),
+                            LocalState::Manual => ("Replace", true),
+                        };
+                        if ui.add_enabled(idle, egui::Button::new(primary)).clicked() {
+                            action = Some(Job::Install(m.clone()));
+                        }
+                        if show_remove
+                            && ui.add_enabled(idle, egui::Button::new("Remove")).clicked()
+                        {
+                            action = Some(Job::Remove(m.name.clone()));
+                        }
+                    });
+                    ui.end_row();
+                }
             });
         if self.mods.is_empty() && idle {
             ui.label("No released mods found.");
@@ -366,39 +383,29 @@ impl App {
             return;
         };
         self.busy = Some(format!("Updating {} mods…", mods.len()));
-        let tx = self.tx.clone();
-        let ctx = self.ctx.clone();
-        std::thread::spawn(move || {
+        self.spawn(move || {
             let msgs: Vec<String> = mods
                 .iter()
                 .map(|m| do_install(&game, m).unwrap_or_else(|e| format!("{}: {e}", m.name)))
                 .collect();
-            let _ = tx.send(Done::Op(Ok(msgs.join(" "))));
-            ctx.request_repaint();
+            Done::Op(Ok(msgs.join(" ")))
         });
     }
 }
 
 fn do_install(game: &std::path::Path, m: &RemoteMod) -> Result<String, String> {
-    let token = github::token()?;
-    let bytes = github::download_asset(&token, github::ORG, &m.repo, m.asset.id)?;
+    let bytes = github::download(&m.asset.browser_download_url)?;
     github::verify(&bytes, m.sha256.as_deref(), &m.asset.name)?;
     install::install(game, &m.name, &m.version, &m.repo, &m.asset.name, &bytes)?;
     Ok(format!("Installed {} {}.", m.name, m.version))
 }
 
 fn do_install_melon(game: &std::path::Path) -> Result<String, String> {
-    let token = github::token()?;
-    let asset = github::release_asset(&token, "LavaGang", "MelonLoader", MELON_TAG, MELON_ASSET)?;
-    let bytes = github::download_asset(&token, "LavaGang", "MelonLoader", asset.id)?;
-    let digest = asset
-        .digest
-        .as_deref()
-        .and_then(|d| d.strip_prefix("sha256:"));
-    github::verify(&bytes, digest, MELON_ASSET)?;
+    let bytes = github::download(MELON_URL)?;
+    github::verify(&bytes, Some(MELON_SHA256), "MelonLoader")?;
     install::install_melonloader(game, &bytes)?;
     Ok(format!(
-        "Installed MelonLoader {MELON_TAG}. Start the game once to let it generate its files."
+        "Installed MelonLoader {MELON_VERSION}. Start the game once to let it generate its files."
     ))
 }
 
@@ -427,28 +434,36 @@ impl eframe::App for App {
             ui.add_space(4.0);
         });
         egui::CentralPanel::default().show(ui, |ui| {
-            self.game_section(ui);
-            ui.separator();
-            self.melon_section(ui);
-            if self.game.is_some() {
-                ui.separator();
-            }
-            self.mods_section(ui);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    self.game_section(ui);
+                    if self.game.is_some() {
+                        ui.separator();
+                        self.melon_section(ui);
+                    }
+                    ui.separator();
+                    self.mods_section(ui);
+                });
         });
     }
 }
 
 fn main() -> eframe::Result {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("WWTHP Mod Installer")
-            .with_inner_size([760.0, 560.0])
-            .with_min_inner_size([520.0, 400.0]),
-        ..Default::default()
-    };
+    let deck = game::is_steam_deck();
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("WWTHP Mod Installer")
+        .with_inner_size([800.0, 640.0])
+        .with_min_inner_size([520.0, 400.0]);
+    if deck {
+        viewport = viewport.with_maximized(true);
+    }
     eframe::run_native(
         "WWTHP Mod Installer",
-        options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        eframe::NativeOptions {
+            viewport,
+            ..Default::default()
+        },
+        Box::new(move |cc| Ok(Box::new(App::new(cc, deck)))),
     )
 }
