@@ -1,7 +1,6 @@
-//! GitHub access: the token comes from the GitHub CLI (`gh auth token`), since the mod repos are private.
+//! GitHub API access: mod list, releases and asset downloads (token from `auth`).
 
 use std::io::Read;
-use std::process::Command;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -10,6 +9,8 @@ use sha2::{Digest, Sha256};
 pub const ORG: &str = "WWTHP";
 /// Repos in the org that aren't mods.
 const NOT_MODS: &[&str] = &["oth-installer"];
+/// Error prefix for a rejected token (the UI then offers sign-in).
+pub const AUTH_REJECTED: &str = "GitHub rejected the login (expired or revoked).";
 const MAX_DOWNLOAD: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -52,67 +53,6 @@ struct Release {
     assets: Vec<Asset>,
 }
 
-/// Finds a GitHub token: `GH_TOKEN` / `GITHUB_TOKEN`, else `gh auth token`.
-pub fn token() -> Result<String, String> {
-    for var in ["GH_TOKEN", "GITHUB_TOKEN"] {
-        if let Ok(t) = std::env::var(var) {
-            if !t.trim().is_empty() {
-                return Ok(t.trim().to_string());
-            }
-        }
-    }
-    let mut last_err = String::from("the GitHub CLI (gh) was not found");
-    for gh in gh_candidates() {
-        let mut cmd = Command::new(&gh);
-        cmd.args(["auth", "token", "--hostname", "github.com"]);
-        hide_console(&mut cmd);
-        match cmd.output() {
-            Ok(out) if out.status.success() => {
-                let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !t.is_empty() {
-                    return Ok(t);
-                }
-            }
-            Ok(out) => {
-                last_err = format!(
-                    "`gh auth token` failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-            }
-            Err(_) => {}
-        }
-    }
-    Err(format!(
-        "No GitHub login: {last_err}. Install the GitHub CLI (https://cli.github.com) and run `gh auth login`."
-    ))
-}
-
-fn gh_candidates() -> Vec<String> {
-    let mut c = vec!["gh".to_string()];
-    // Apps started from Finder/the desktop don't get the shell's PATH.
-    if cfg!(target_os = "macos") {
-        c.extend(["/opt/homebrew/bin/gh".into(), "/usr/local/bin/gh".into()]);
-    } else if cfg!(windows) {
-        c.push(r"C:\Program Files\GitHub CLI\gh.exe".into());
-    } else {
-        c.extend([
-            "/usr/bin/gh".into(),
-            "/usr/local/bin/gh".into(),
-            "/home/linuxbrew/.linuxbrew/bin/gh".into(),
-        ]);
-    }
-    c
-}
-
-#[cfg(windows)]
-fn hide_console(cmd: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    cmd.creation_flags(CREATE_NO_WINDOW);
-}
-#[cfg(not(windows))]
-fn hide_console(_: &mut Command) {}
-
 fn agent(follow_redirects: bool) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(300)))
@@ -149,12 +89,24 @@ fn api_json<T: for<'de> Deserialize<'de>>(token: &str, path: &str) -> Result<Opt
             .map(Some)
             .map_err(|e| format!("bad JSON from {path}: {e}")),
         404 => Ok(None),
-        401 => Err("GitHub rejected the token (401). Run `gh auth login` again.".into()),
+        401 => Err(format!("{AUTH_REJECTED} Sign in again.")),
         s => Err(format!(
             "GitHub {path}: HTTP {s}: {}",
             body.chars().take(200).collect::<String>()
         )),
     }
+}
+
+#[derive(Deserialize)]
+struct User {
+    login: String,
+}
+
+/// The login the token belongs to (also checks the token works).
+pub fn whoami(token: &str) -> Result<String, String> {
+    api_json::<User>(token, "/user")?
+        .map(|u| u.login)
+        .ok_or_else(|| "GitHub didn't return the signed-in user.".into())
 }
 
 /// Every mod repo in the org with a published release.
@@ -276,20 +228,23 @@ pub fn download_asset(
     Ok(bytes)
 }
 
-/// The asset of a specific public release (used for MelonLoader).
-pub fn release_asset(
-    token: &str,
-    owner: &str,
-    repo: &str,
-    tag: &str,
-    name: &str,
-) -> Result<Asset, String> {
-    let rel: Release = api_json(token, &format!("/repos/{owner}/{repo}/releases/tags/{tag}"))?
-        .ok_or_else(|| format!("{owner}/{repo} release {tag} not found"))?;
-    rel.assets
-        .into_iter()
-        .find(|a| a.name == name)
-        .ok_or_else(|| format!("{owner}/{repo} {tag} has no {name}"))
+/// Downloads a public file (no token), following redirects.
+pub fn download_public(url: &str) -> Result<Vec<u8>, String> {
+    let resp = agent(true)
+        .get(url)
+        .call()
+        .map_err(|e| format!("Download failed: {e}"))?;
+    let status = resp.status().as_u16();
+    if status != 200 {
+        return Err(format!("Download of {url} failed: HTTP {status}"));
+    }
+    let mut bytes = Vec::new();
+    resp.into_body()
+        .into_reader()
+        .take(MAX_DOWNLOAD)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Download interrupted: {e}"))?;
+    Ok(bytes)
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -388,7 +343,7 @@ mod live {
     #[test]
     #[ignore = "network + GitHub login"]
     fn lists_downloads_and_verifies_every_mod() {
-        let t = token().unwrap();
+        let t = crate::auth::token().unwrap();
         let mods = list_mods(&t).unwrap();
         assert!(!mods.is_empty());
         let game = tempfile::tempdir().unwrap();
@@ -416,27 +371,14 @@ mod live {
         for m in &mods {
             crate::install::uninstall(game.path(), &m.name).unwrap();
         }
-        let a = release_asset(
-            &t,
-            "LavaGang",
-            "MelonLoader",
-            "v0.7.3",
-            "MelonLoader.x64.zip",
-        )
-        .unwrap();
-        let z = download_asset(&t, "LavaGang", "MelonLoader", a.id).unwrap();
-        verify(
-            &z,
-            a.digest.as_deref().and_then(|d| d.strip_prefix("sha256:")),
-            "ml",
-        )
-        .unwrap();
+        println!("signed in as {}", whoami(&t).unwrap());
+        let z = download_public(crate::MELON_URL).unwrap();
+        verify(&z, Some(crate::MELON_SHA256), "MelonLoader").unwrap();
         crate::install::install_melonloader(game.path(), &z).unwrap();
         assert!(game.path().join("version.dll").is_file());
         assert!(game
             .path()
             .join("MelonLoader/net6/MelonLoader.dll")
             .is_file());
-        println!("melonloader digest={:?}", a.digest);
     }
 }

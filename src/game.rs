@@ -199,6 +199,20 @@ pub fn runs_under_proton(game: &Path) -> bool {
             .is_some_and(|steamapps| steamapps.join("compatdata").join(APP_ID).is_dir())
 }
 
+/// Steam Deck (or another SteamOS handheld): bigger UI, maximized window.
+pub fn is_steam_deck() -> bool {
+    if std::env::var("SteamDeck").is_ok_and(|v| v == "1") {
+        return true;
+    }
+    let board =
+        std::fs::read_to_string("/sys/devices/virtual/dmi/id/board_name").unwrap_or_default();
+    if matches!(board.trim(), "Jupiter" | "Galileo") {
+        return true;
+    }
+    std::fs::read_to_string("/etc/os-release")
+        .is_ok_and(|t| t.lines().any(|l| l.trim() == "ID=steamos"))
+}
+
 /// Whether the game is running (installing over a running game fails or corrupts state).
 pub fn is_running() -> bool {
     use sysinfo::{ProcessesToUpdate, System};
